@@ -103,6 +103,64 @@ BEGIN
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      WHERE serial = OLD.serial AND version = OLD.version;
 END;
+
+-- ---------------------------------------------------------------------------
+-- Staged (two-phase) correction imports.
+--
+-- A batch is created by a preview request and only touches these staging
+-- tables: formal flows, groups and candidates stay untouched until the batch
+-- is confirmed. The watch table snapshots every flow whose change would
+-- invalidate the preview (all file rows, including not-yet-existing ones, and
+-- every member of every group that will be disbanded), so confirm-time
+-- validation can detect the three required change kinds: original value,
+-- claim status and group membership.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS import_batches (
+    id            TEXT PRIMARY KEY,
+    side          TEXT NOT NULL CHECK (side IN ('bank', 'internal')),
+    filename      TEXT,
+    status        TEXT NOT NULL DEFAULT 'staged'
+                      CHECK (status IN ('staged', 'confirmed', 'rejected')),
+    received      INTEGER NOT NULL,
+    added_count   INTEGER NOT NULL,
+    changed_count INTEGER NOT NULL,
+    unchanged_count INTEGER NOT NULL,
+    disbanded_group_ids TEXT NOT NULL DEFAULT '[]',
+    conflicts_json      TEXT NOT NULL DEFAULT '[]',
+    receipt_json        TEXT,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    confirmed_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_batches_status ON import_batches(status);
+
+CREATE TABLE IF NOT EXISTS import_batch_rows (
+    batch_id   TEXT NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    ord        INTEGER NOT NULL,
+    serial     TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    txn_date   TEXT NOT NULL,
+    amount     INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    change_type TEXT NOT NULL
+                    CHECK (change_type IN ('added', 'changed', 'unchanged')),
+    disband_group_id INTEGER,
+    PRIMARY KEY (batch_id, ord)
+);
+CREATE INDEX IF NOT EXISTS idx_ibr_batch ON import_batch_rows(batch_id);
+
+CREATE TABLE IF NOT EXISTS import_batch_watch (
+    batch_id   TEXT NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    side       TEXT NOT NULL CHECK (side IN ('bank', 'internal')),
+    serial     TEXT NOT NULL,
+    existed    INTEGER NOT NULL,
+    version    INTEGER,
+    status     TEXT,
+    group_id   INTEGER,
+    content_hash TEXT,
+    disband_group_id INTEGER,
+    PRIMARY KEY (batch_id, side, serial)
+);
+CREATE INDEX IF NOT EXISTS idx_ibw_batch ON import_batch_watch(batch_id);
 """
 
 

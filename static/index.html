@@ -59,6 +59,22 @@
         color:var(--muted); margin:8px 0 0; }
   .row-actions { display:flex; gap:8px; flex-wrap:wrap; }
   .stat { font-size:12px; color:var(--muted); }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; }
+  .pill.added { background:rgba(34,197,94,.15); color:var(--ok); }
+  .pill.changed { background:rgba(245,158,11,.15); color:var(--warn); }
+  .pill.unchanged { background:rgba(148,163,184,.18); color:var(--muted); }
+  .pill.staged { background:rgba(56,189,248,.15); color:var(--accent); }
+  .pill.confirmed { background:rgba(34,197,94,.15); color:var(--ok); }
+  .pill.rejected { background:rgba(239,68,68,.15); color:var(--err); }
+  .batch { border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .batch .head { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap;
+                 align-items:center; margin-bottom:8px; }
+  .batch .mono-id { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; color:var(--muted); }
+  .conflict-box { border-left:4px solid var(--err); background:rgba(239,68,68,.08);
+                  padding:8px 10px; border-radius:6px; margin-top:8px; font-size:12px; }
+  .disband-box { border-left:4px solid var(--warn); background:rgba(245,158,11,.08);
+                 padding:8px 10px; border-radius:6px; margin-top:8px; font-size:12px; }
+  .radio-row { display:flex; gap:14px; margin-bottom:10px; font-size:13px; }
 </style>
 </head>
 <body>
@@ -92,6 +108,26 @@
         <button class="secondary" onclick="loadSample('internal')">填入示例数据</button>
       </div>
     </div>
+  </section>
+
+  <section class="card" style="border-color:#0369a1">
+    <h2>Ⓜ 暂存批量更正（两阶段：预审 → 确认，预审不动正式流水）
+      <span class="stat" id="batchStat"></span></h2>
+    <p class="hint">选择一侧并上传原格式 CSV 后点击「预审」：系统保存批次并逐条标注
+      <b>新增 / 变更 / 不变</b>，同时列出确认时将整组撤销的匹配组及全部成员原值。
+      预审期间正式流水、上传与对账完全不受影响；确认时若任一受监视流水的原值、认领状态
+      或组成员发生变化，整批拒绝并列出冲突；无关流水变化不使预审失效（容量允许时）。
+      重复/并发确认同一批次只返回首次成功回执，不会二次覆盖。</p>
+    <div class="radio-row">
+      <label><input type="radio" name="stagedSide" value="bank" checked> 银行侧</label>
+      <label><input type="radio" name="stagedSide" value="internal"> 内部侧</label>
+    </div>
+    <input type="file" id="stagedFile" accept=".csv,text/csv">
+    <div class="row-actions">
+      <button onclick="previewBatch()">① 预审并生成批次</button>
+      <button class="secondary" onclick="loadBatches()">刷新批次列表</button>
+    </div>
+    <div id="batchList" style="margin-top:14px"><p class="muted">暂无暂存批次。</p></div>
   </section>
 
   <section class="card">
@@ -214,6 +250,162 @@ async function confirmCandidate(id, versions) {
   }
 }
 
+// ---- Staged (two-phase) correction imports -------------------------------
+function stagedSide() {
+  return document.querySelector('input[name="stagedSide"]:checked').value;
+}
+function changePill(t) {
+  const label = { added: "新增", changed: "变更", unchanged: "不变" }[t] || t;
+  return `<span class="pill ${t}">${label}</span>`;
+}
+function statusPill(s) {
+  const label = { staged: "待确认", confirmed: "已确认", rejected: "已拒绝" }[s] || s;
+  return `<span class="pill ${s}">${label}</span>`;
+}
+
+async function previewBatch() {
+  const input = document.getElementById("stagedFile");
+  if (!input.files.length) return toast("请先选择 CSV 文件", "e");
+  const side = stagedSide();
+  const fd = new FormData();
+  fd.append("file", input.files[0]);
+  try {
+    const batch = await api(`/api/imports/${side}/preview`, { method: "POST", body: fd });
+    toast(`预审完成：批次 ${batch.batch_id.slice(0, 8)}… 新增 ${batch.added} · `
+      + `变更 ${batch.changed} · 不变 ${batch.unchanged}`
+      + (batch.disbanded_group_ids.length
+        ? ` · 将撤销组 ${batch.disbanded_group_ids.join(", ")}` : ""), "s");
+    await loadBatches(batch.batch_id);
+  } catch (e) { toast(`预审失败(HTTP ${e.status}): ${e.message}`, "e"); }
+}
+
+async function confirmBatch(batchId) {
+  if (!confirm(`确认整批应用暂存批次 ${batchId.slice(0, 8)}…？\n`
+      + "后台将复核所有受监视流水；冲突会整批拒绝，成功则回执与全部改动同时生效。")) return;
+  try {
+    const payload = await api(`/api/imports/${batchId}/confirm`, { method: "POST" });
+    const r = payload.receipt;
+    toast(`批次已确认：应用新增/更正 ${r.applied_upserted} 条，内容未变 `
+      + `${r.applied_unchanged} 条`
+      + (r.disbanded_groups.length ? `，撤销组 ${r.disbanded_groups.join(", ")}` : ""), "s");
+    await sleep(250);
+    await Promise.all([loadBatches(batchId), refreshAll()]);
+  } catch (e) {
+    let extra = "";
+    if (e.status === 409 && e.payload?.detail?.conflicts?.length)
+      extra = `\n冲突 ${e.payload.detail.conflicts.length} 项: `
+        + e.payload.detail.conflicts.map(c =>
+            c.serial ? `${c.serial}(${c.reason})` : c.reason).join(", ");
+    toast(`确认失败(HTTP ${e.status}): ${e.message}${extra}`, "e");
+    await loadBatches(batchId);
+  }
+}
+
+function renderDisbandGroups(groups) {
+  if (!groups.length) return "";
+  return groups.map(g => `
+    <div class="disband-box">
+      <b>待撤销匹配组 #${g.group_id}</b>（共 ${g.members.length} 名成员，以下为<b>原值</b>）
+      <table style="margin-top:6px">
+        <thead><tr><th>侧</th><th>流水号</th><th>户名</th><th>日期</th><th>金额</th><th>状态</th><th>v</th></tr></thead>
+        <tbody>${g.members.map(m => `<tr>
+          <td>${m.side === "bank" ? "银行" : "内部"}</td>
+          <td class="mono">${esc(m.serial)}</td><td>${esc(m.name)}</td>
+          <td>${esc(m.txn_date)}</td><td>${m.amount}</td>
+          <td>${statusTag(m.status)}</td><td class="mono">v${m.version}</td></tr>`).join("")}
+        </tbody></table>
+    </div>`).join("");
+}
+
+function renderConflicts(conflicts) {
+  if (!conflicts || !conflicts.length) return "";
+  const reasonText = {
+    flow_changed: "原值变更", status_changed: "认领状态变更",
+    membership_changed: "组成员变更", flow_appeared: "预审时不存在、现已出现",
+    flow_missing: "流水已消失", capacity_exceeded: "容量超限",
+  };
+  return `<div class="conflict-box"><b>冲突明细（整批拒绝）：</b>
+    <ul>${conflicts.map(c => `<li>
+      ${c.serial ? `<span class="mono">${esc(c.serial)}</span>（${c.side === "bank" ? "银行" : "内部"}）· ` : ""}
+      ${reasonText[c.reason] || c.reason}
+      ${c.message ? "· " + esc(c.message) : ""}
+    </li>`).join("")}</ul></div>`;
+}
+
+function renderBatch(b) {
+  const id = b.batch_id;
+  const rows = (b.rows || []).map(r => `<tr>
+      <td class="mono">${esc(r.serial)}</td><td>${esc(r.name)}</td>
+      <td>${esc(r.txn_date)}</td><td>${r.amount}</td>
+      <td>${changePill(r.change_type)}</td>
+      <td>${r.disband_group_id ? `#${r.disband_group_id}` : "—"}</td>
+    </tr>`).join("");
+  return `
+  <div class="batch">
+    <div class="head">
+      <div><b>批次 </b><span class="mono-id">${esc(id)}</span>
+        <span style="margin-left:8px">${statusPill(b.status)}</span>
+        <span class="stat" style="margin-left:8px">${b.side === "bank" ? "银行侧" : "内部侧"}
+          · ${esc(b.filename || "")} · 创建 ${esc((b.created_at || "").replace("T", " ").slice(0, 19))}</span>
+      </div>
+      <div class="row-actions">
+        ${b.status === "staged"
+          ? `<button onclick='confirmBatch("${id}")'>② 整批确认</button>` : ""}
+        <button class="secondary" onclick='loadOneBatch("${id}")'>展开明细</button>
+      </div>
+    </div>
+    <div class="stat">
+      共 ${b.received} 条：<span class="pill added">新增 ${b.added}</span>
+      <span class="pill changed">变更 ${b.changed}</span>
+      <span class="pill unchanged">不变 ${b.unchanged}</span>
+      ${b.confirmed_at ? ` · 确认于 ${esc(b.confirmed_at.replace("T", " ").slice(0, 19))}` : ""}
+    </div>
+    ${b.rows ? `<div class="scroll" style="max-height:220px;margin-top:8px">
+      <table><thead><tr><th>流水号</th><th>户名</th><th>日期</th><th>暂存金额</th>
+        <th>判定</th><th>涉撤销组</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="6" class="muted">无明细</td></tr>'}</tbody></table></div>` : ""}
+    ${b.disband_groups ? renderDisbandGroups(b.disband_groups) : ""}
+    ${b.conflicts ? renderConflicts(b.conflicts) : ""}
+    ${b.receipt ? `<details style="margin-top:8px"><summary>首次成功回执（重放确认始终返回此回执）</summary>
+      <pre>${esc(JSON.stringify(b.receipt, null, 2))}</pre></details>` : ""}
+    ${b.status === "rejected" && b.conflicts === null
+      ? '<p class="stat" style="margin-top:6px">点击「展开明细」查看冲突项。</p>' : ""}
+  </div>`;
+}
+
+async function loadOneBatch(batchId) {
+  try {
+    const b = await api(`/api/imports/${batchId}`);
+    const box = document.getElementById("batchList");
+    const existing = box.querySelector(`[data-batch="${batchId}"]`);
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("data-batch", batchId);
+    wrapper.innerHTML = renderBatch(b);
+    if (existing) existing.replaceWith(wrapper);
+    else box.prepend(wrapper);
+  } catch (e) { toast("加载批次失败: " + e.message, "e"); }
+}
+
+async function loadBatches(highlightId) {
+  try {
+    const data = await api("/api/imports");
+    const batches = data.batches;
+    document.getElementById("batchStat").textContent = `共 ${batches.length} 个批次`;
+    const box = document.getElementById("batchList");
+    if (!batches.length) {
+      box.innerHTML = '<p class="muted">暂无暂存批次。</p>';
+      return;
+    }
+    // Compact summaries; only the highlighted batch is fetched in full and
+    // expanded with its rows, disband-group originals, conflicts and receipt.
+    box.innerHTML = batches.map(b =>
+      `<div data-batch="${b.batch_id}">${renderBatch({
+        ...b, rows: null, disband_groups: null, conflicts: null, receipt: null,
+      })}</div>`).join("");
+    if (highlightId) await loadOneBatch(highlightId);
+  } catch (e) { toast("批次列表加载失败: " + e.message, "e"); }
+}
+
 function renderCandidates(list) {
   const box = document.getElementById("candidates");
   document.getElementById("candStat").textContent = `共 ${list.length} 个可确认组合`;
@@ -271,21 +463,26 @@ function renderUnmatched(u) {
 
 async function refreshAll() {
   try {
-    const [cand, bank, internal, matches, unmatched] = await Promise.all([
+    const [cand, bank, internal, matches, unmatched, batches] = await Promise.all([
       api("/api/candidates"),
       api("/api/flows/bank"),
       api("/api/flows/internal"),
       api("/api/matches"),
       api("/api/unmatched"),
+      api("/api/imports"),
     ]);
     renderCandidates(cand.candidates);
     renderFlows("bank", bank.flows);
     renderFlows("internal", internal.flows);
     renderMatches(matches.matches);
     renderUnmatched(unmatched);
+    // Lightweight batch summaries (no detail fetch) for the periodic refresh.
+    document.getElementById("batchStat").textContent =
+      `共 ${batches.batches.length} 个批次`;
   } catch (e) { toast("刷新失败: " + e.message, "e"); }
 }
 refreshAll();
+loadBatches();
 setInterval(refreshAll, 5000);
 </script>
 </body>

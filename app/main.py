@@ -10,6 +10,10 @@ GET    /api/matches                       confirmed correspondences
 GET    /api/matches/{group_id}            one confirmed correspondence
 GET    /api/unmatched                     unmatched flow details
 POST   /api/recompute                     force a synchronous recomputation
+POST   /api/imports/{side}/preview        stage a correction CSV (no formal change)
+GET    /api/imports                       all staged-import batches
+GET    /api/imports/{batch_id}            one batch with full preview / receipt
+POST   /api/imports/{batch_id}/confirm    atomically apply a staged batch
 GET    /api/health                        liveness probe
 GET    /                                  interactive demo console
 """
@@ -35,11 +39,17 @@ from .matching_service import (
     list_groups,
     list_unmatched,
 )
-from .models import BANK, INTERNAL, ReconcileError
+from .models import ReconcileError
 from .recompute import RecomputeWorker
+from .staged_import import confirm_batch, create_batch, get_batch, list_batches
 
-DB_PATH = os.environ.get("RECONCILE_DB", "/data/reconcile.db")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
+
+
+def _database_path() -> str:
+    # Resolved at startup so tests (and alternative deployments) can point the
+    # process at a different database without re-importing the module.
+    return os.environ.get("RECONCILE_DB", "/data/reconcile.db")
 
 
 class ConfirmRequest(BaseModel):
@@ -55,7 +65,7 @@ class RecomputeResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db = Database(DB_PATH)
+    app.state.db = Database(_database_path())
     app.state.worker = RecomputeWorker(app.state.db)
     app.state.worker.start()
     # Build an initial candidate set without blocking request serving.
@@ -84,6 +94,9 @@ async def reconcile_error_handler(request: Request, exc: ReconcileError):
     latest = getattr(exc, "latest", None)
     if latest:
         detail["latest"] = latest
+    conflicts = getattr(exc, "conflicts", None)
+    if conflicts:
+        detail["conflicts"] = conflicts
     return JSONResponse(status_code=exc.status, content={"detail": detail})
 
 
@@ -150,6 +163,52 @@ async def get_unmatched():
 @app.post("/api/recompute", tags=["candidates"], response_model=RecomputeResponse)
 async def post_recompute():
     return RecomputeResponse(generation=app.state.worker.run_once_now())
+
+
+# ---------------------------------------------------------------------------
+# Staged (two-phase) correction imports
+# ---------------------------------------------------------------------------
+
+@app.post("/api/imports/{side}/preview", tags=["staged-imports"])
+async def preview_import(
+    side: Literal["bank", "internal"], file: UploadFile = File(...)
+):
+    """Phase 1: parse and stage one side's CSV without touching formal data."""
+    raw = await file.read()
+    rows = parse_flow_csv(raw)
+    return create_batch(app.state.db, side, rows, file.filename)
+
+
+@app.get("/api/imports", tags=["staged-imports"])
+async def get_batches():
+    return {"batches": list_batches(app.state.db)}
+
+
+@app.get("/api/imports/{batch_id}", tags=["staged-imports"])
+async def get_one_batch(batch_id: str):
+    try:
+        return get_batch(app.state.db, batch_id)
+    except ReconcileError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.post("/api/imports/{batch_id}/confirm", tags=["staged-imports"])
+async def confirm_import(batch_id: str):
+    """Phase 2: validate watched flows then apply the whole batch atomically.
+
+    Repeated / concurrent confirmation of an already confirmed batch returns
+    the first frozen receipt and never re-applies any content.
+    """
+    try:
+        payload = confirm_batch(app.state.db, batch_id)
+    except ReconcileError as exc:
+        detail = {"message": str(exc)}
+        if getattr(exc, "conflicts", None):
+            detail["conflicts"] = exc.conflicts
+        raise HTTPException(status_code=exc.status, detail=detail) from exc
+    # Formal flows changed: refresh candidates in the background, never inline.
+    app.state.worker.schedule()
+    return payload
 
 
 @app.get("/api/health", tags=["meta"])

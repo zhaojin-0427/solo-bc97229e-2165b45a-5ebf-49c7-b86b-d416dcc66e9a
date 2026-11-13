@@ -11,7 +11,7 @@ import tempfile
 
 import pytest
 
-# Point the app at a throwaway database before importing it.
+# A throwaway database is (re)created per test function via the fixture below.
 _tmp = tempfile.mkdtemp()
 os.environ["RECONCILE_DB"] = os.path.join(_tmp, "api_test.db")
 
@@ -33,8 +33,11 @@ INTERNAL_CSV = (
 )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def client():
+    # Fresh database file per test for full isolation.
+    db_path = os.path.join(tempfile.mkdtemp(), "api_test.db")
+    os.environ["RECONCILE_DB"] = db_path
     with TestClient(app) as c:
         yield c
 
@@ -82,6 +85,9 @@ def test_full_workflow(client):
 
 
 def test_stale_confirm_returns_409_with_latest(client):
+    _upload(client, "bank", BANK_CSV)
+    _upload(client, "internal", INTERNAL_CSV)
+    client.post("/api/recompute")
     cands = client.get("/api/candidates").json()["candidates"]
     cand = next(c for c in cands if c["bank"]["serial"] == "B1")
     old = dict(cand["expected_versions"])
@@ -95,31 +101,120 @@ def test_stale_confirm_returns_409_with_latest(client):
     assert resp.json()["detail"]["latest"]["flows"]
 
 
-def test_concurrent_confirm_mutual_exclusion(client):
+def test_concurrent_confirm_mutual_exclusion():
+    # Real HTTP concurrency: Starlette's TestClient serialises calls in a
+    # single portal, so run the actual uvicorn server on an ephemeral port and
+    # fire the two confirmations from real threads over real sockets.
+    import socket
     import threading
+    import time
+    import urllib.request
 
-    cands = client.get("/api/candidates").json()["candidates"]
-    b1 = [c for c in cands if c["bank"]["serial"] == "B1"]
-    statuses = []
-    lock = threading.Lock()
+    import uvicorn
 
-    def fire(candidate):
-        resp = client.post(
-            f"/api/candidates/{candidate['candidate_id']}/confirm",
-            json={"expected_versions": candidate["expected_versions"]},
+    db_path = os.path.join(tempfile.mkdtemp(), "concurrent_api.db")
+    os.environ["RECONCILE_DB"] = db_path
+    from app.main import app as real_app
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    config = uvicorn.Config(real_app, host="127.0.0.1", port=port, log_level="error")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(base + "/api/health", timeout=1)
+            break
+        except Exception:
+            time.sleep(0.1)
+
+    try:
+        # I1+I2 sum to B1's 10000 and I3 alone equals 10000: two competing
+        # candidates sharing bank flow B1.
+        bank_csv = (
+            "流水号,户名,日期,金额(分)\n"
+            "B1,甲公司,2026-11-10,10000\n"
+            "B2,乙公司,2026-11-11,5000\n"
         )
-        with lock:
-            statuses.append(resp.status_code)
+        internal_csv = (
+            "流水号,户名,日期,金额(分)\n"
+            "I1,甲公司,2026-11-09,4000\n"
+            "I2,甲公司,2026-11-11,6000\n"
+            "I3,甲公司,2026-11-10,10000\n"
+            "I4,乙公司,2026-11-10,2500\n"
+            "I5,乙公司,2026-11-12,2500\n"
+        )
 
-    threads = [threading.Thread(target=fire, args=(c,)) for c in b1]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert sorted(statuses) == [200, 409]
+        def _upload(path, content):
+            boundary = "----t"
+            body = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+                f"filename=\"f.csv\"\r\nContent-Type: text/csv\r\n\r\n"
+                f"{content}\r\n--{boundary}--\r\n"
+            ).encode()
+            req = urllib.request.Request(
+                base + path, data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            urllib.request.urlopen(req, timeout=5)
+
+        _upload("/api/uploads/bank", bank_csv)
+        _upload("/api/uploads/internal", internal_csv)
+        req = urllib.request.Request(base + "/api/recompute", data=b"", method="POST")
+        urllib.request.urlopen(req, timeout=5)
+        cands = __import__("json").loads(
+            urllib.request.urlopen(base + "/api/candidates", timeout=5).read()
+        )["candidates"]
+        b1 = [c for c in cands if c["bank"]["serial"] == "B1"]
+        assert len(b1) == 2
+
+        statuses = []
+        slock = threading.Lock()
+
+        def fire(candidate):
+            data = __import__("json").dumps(
+                {"expected_versions": candidate["expected_versions"]}
+            ).encode()
+            req = urllib.request.Request(
+                f"{base}/api/candidates/{candidate['candidate_id']}/confirm",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                code = 200
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+            with slock:
+                statuses.append(code)
+
+        threads = [threading.Thread(target=fire, args=(c,)) for c in b1]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(statuses) == [200, 409]
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
 
 
 def test_correction_disbands_group(client):
+    _upload(client, "bank", BANK_CSV)
+    _upload(client, "internal", INTERNAL_CSV)
+    client.post("/api/recompute")
+    cands = client.get("/api/candidates").json()["candidates"]
+    cand = next(c for c in cands if c["bank"]["serial"] == "B2")
+    client.post(
+        f"/api/candidates/{cand['candidate_id']}/confirm",
+        json={"expected_versions": cand["expected_versions"]},
+    )
     matches_before = len(client.get("/api/matches").json()["matches"])
     assert matches_before >= 1
     corrected = "流水号,户名,日期,金额(分)\nB2,乙公司,2026-11-11,9999\n"

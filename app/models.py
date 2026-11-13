@@ -11,6 +11,16 @@ INTERNAL = "internal"
 UNMATCHED = "unmatched"
 MATCHED = "matched"
 
+# Staged-import batch lifecycle.
+BATCH_STAGED = "staged"          # preview stored, awaiting confirmation
+BATCH_CONFIRMED = "confirmed"    # whole batch applied; receipt frozen
+BATCH_REJECTED = "rejected"      # confirm-time conflict check failed
+
+# Per-row change classification produced by a staged preview.
+CHANGE_ADDED = "added"           # serial does not exist yet
+CHANGE_CHANGED = "changed"       # serial exists with different content
+CHANGE_UNCHANGED = "unchanged"   # serial exists with identical content hash
+
 
 @dataclass(frozen=True)
 class FlowRow:
@@ -79,3 +89,23 @@ class NotFound(ReconcileError):
 
 class CapacityExceeded(ReconcileError):
     status = 422
+
+
+class BatchConflict(ReconcileError):
+    """Confirm-time validation found a changed watched flow / group member."""
+
+    status = 409
+
+    def __init__(self, message: str, conflicts: Optional[list] = None) -> None:
+        super().__init__(message)
+        self.conflicts = conflicts or []
+
+
+class BatchNotFound(ReconcileError):
+    status = 404
+
+
+class BatchNotStaged(ReconcileError):
+    """Batch is already confirmed (terminal) or rejected (terminal)."""
+
+    status = 409
