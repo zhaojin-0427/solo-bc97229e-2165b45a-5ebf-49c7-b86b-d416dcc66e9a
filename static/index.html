@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>银行入账 × 内部收款 核对账控制台</title>
+<style>
+  :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --text:#e2e8f0;
+          --muted:#94a3b8; --accent:#38bdf8; --ok:#22c55e; --warn:#f59e0b;
+          --err:#ef4444; --chip:#0ea5e9; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:var(--text); }
+  header { padding:18px 24px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:13px; }
+  main { padding:24px; display:grid; gap:20px; max-width:1280px; margin:0 auto; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media (max-width:900px){ .grid2{grid-template-columns:1fr} }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:12px; padding:16px; }
+  .card h2 { margin:0 0 12px; font-size:15px; display:flex;
+             justify-content:space-between; align-items:center; gap:8px; }
+  .hint { color:var(--muted); font-size:12px; line-height:1.6; margin:0 0 10px; }
+  button { background:var(--accent); color:#082f49; border:0; border-radius:8px;
+           padding:8px 14px; font-weight:600; cursor:pointer; font-size:13px; }
+  button.secondary { background:var(--line); color:var(--text); }
+  button.danger { background:var(--err); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  input[type=file] { color:var(--muted); font-size:12px; width:100%; margin-bottom:10px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line);
+          vertical-align:top; }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0;
+       background:var(--panel); }
+  .scroll { max-height:340px; overflow:auto; border:1px solid var(--line);
+            border-radius:8px; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; }
+  .tag.ok { background:rgba(34,197,94,.15); color:var(--ok); }
+  .tag.warn { background:rgba(245,158,11,.15); color:var(--warn); }
+  .tag.err { background:rgba(239,68,68,.15); color:var(--err); }
+  .tag.info { background:rgba(14,165,233,.15); color:var(--chip); }
+  .toast { position:fixed; right:20px; bottom:20px; display:grid; gap:8px; z-index:9; }
+  .toast div { background:var(--panel); border:1px solid var(--line);
+               border-left:4px solid var(--accent); padding:10px 14px;
+               border-radius:8px; font-size:13px; max-width:420px; }
+  .toast .e { border-left-color:var(--err); }
+  .toast .s { border-left-color:var(--ok); }
+  .muted { color:var(--muted); }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .cand { border:1px solid var(--line); border-radius:10px; padding:10px 12px;
+          margin-bottom:10px; }
+  .cand .head { display:flex; justify-content:space-between; gap:10px;
+                align-items:center; flex-wrap:wrap; margin-bottom:6px; }
+  .cand ul { margin:6px 0 0; padding-left:18px; font-size:12.5px; }
+  details summary { cursor:pointer; color:var(--accent); font-size:12.5px; }
+  pre { white-space:pre-wrap; word-break:break-all; font-size:11.5px;
+        color:var(--muted); margin:8px 0 0; }
+  .row-actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .stat { font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🏦 银行入账 × 内部收款 核对账控制台</h1>
+  <span class="sub">FastAPI + SQLite · 同号覆盖 · 乐观并发 · 崩溃不留单边匹配</span>
+  <span style="flex:1"></span>
+  <button class="secondary" onclick="refreshAll()">🔄 刷新全部</button>
+  <button class="secondary" onclick="recompute()">⚙️ 立即重算候选</button>
+  <a class="sub" href="/docs" target="_blank">Swagger 文档 ↗</a>
+</header>
+
+<main>
+  <section class="grid2">
+    <div class="card">
+      <h2>① 上传银行流水 CSV <span class="stat">≤100 条 · 金额单位:分</span></h2>
+      <p class="hint">表头支持：流水号/户名/日期/金额(分)（或 serial/name/date/amount）。
+        同号覆盖；同内容重传不产生任何变化。</p>
+      <input type="file" id="bankFile" accept=".csv,text/csv">
+      <div class="row-actions">
+        <button onclick="upload('bank')">上传银行 CSV</button>
+        <button class="secondary" onclick="loadSample('bank')">填入示例数据</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>② 上传内部收款流水 CSV <span class="stat">≤100 条 · 金额单位:分</span></h2>
+      <p class="hint">已匹配流水被更正会整组撤销，其他成员回到未匹配；更正、撤销与状态同一事务生效。</p>
+      <input type="file" id="internalFile" accept=".csv,text/csv">
+      <div class="row-actions">
+        <button onclick="upload('internal')">上传内部 CSV</button>
+        <button class="secondary" onclick="loadSample('internal')">填入示例数据</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>③ 候选组合（1 条银行 ↔ 1~3 条内部：同名 · 日期差≤2日 · 金额合计相等）
+      <span class="stat" id="candStat"></span></h2>
+    <p class="hint">确认时后台会再次核对最新原始值与 version；并发确认共用流水仅一个成功，
+      失败者返回 409 及最新数据。迟到的重算结果不会被标为可确认。</p>
+    <div id="candidates"><p class="muted">暂无候选，请先上传两侧 CSV。</p></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h2>④ 已确认对应关系 <span class="stat" id="matchStat"></span></h2>
+      <div class="scroll"><table id="matchTable">
+        <thead><tr><th>组号</th><th>银行流水</th><th>内部流水</th><th>金额(分)</th><th>时间</th></tr></thead>
+        <tbody></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>⑤ 未匹配明细 <span class="stat" id="unmatchedStat"></span></h2>
+      <div class="scroll"><table id="unmatchedTable">
+        <thead><tr><th>侧</th><th>流水号</th><th>户名</th><th>日期</th><th>金额(分)</th><th>version</th></tr></thead>
+        <tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h2>银行流水原始值（含认领状态 / version）</h2>
+      <div class="scroll"><table id="bankTable">
+        <thead><tr><th>流水号</th><th>户名</th><th>日期</th><th>金额</th><th>状态</th><th>组</th><th>v</th></tr></thead>
+        <tbody></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>内部流水原始值（含认领状态 / version）</h2>
+      <div class="scroll"><table id="internalTable">
+        <thead><tr><th>流水号</th><th>户名</th><th>日期</th><th>金额</th><th>状态</th><th>组</th><th>v</th></tr></thead>
+        <tbody></tbody></table></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const SAMPLE = {
+  bank: "流水号,户名,日期,金额(分)\nB001,华北贸易公司,2026-11-10,10000\nB002,江南供应链,2026-11-11,5000\nB003,西部零售集团,2026-11-12,8800\nB004,华北贸易公司,2026-11-12,3000\n",
+  internal: "流水号,户名,日期,金额(分)\nI001,华北贸易公司,2026-11-09,4000\nI002,华北贸易公司,2026-11-11,6000\nI003,华北贸易公司,2026-11-10,10000\nI004,江南供应链,2026-11-10,2500\nI005,江南供应链,2026-11-12,2500\nI006,华北贸易公司,2026-11-13,3000\n"
+};
+
+function toast(msg, kind="") {
+  const el = document.createElement("div");
+  if (kind) el.className = kind;
+  el.textContent = msg;
+  document.getElementById("toast").appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+async function api(path, opts={}) {
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data.detail?.message || JSON.stringify(data.detail || data);
+    const err = new Error(msg);
+    err.payload = data;
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+function esc(s){ return String(s ?? "").replace(/[&<>"]/g, c =>
+  ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function statusTag(s){ return s === "matched"
+  ? '<span class="tag ok">已匹配</span>'
+  : '<span class="tag warn">未匹配</span>'; }
+function sideTag(side){ return side === "bank"
+  ? '<span class="tag info">银行</span>' : '<span class="tag info">内部</span>'; }
+
+async function upload(side) {
+  const input = document.getElementById(side + "File");
+  if (!input.files.length) return toast("请先选择 CSV 文件", "e");
+  const fd = new FormData();
+  fd.append("file", input.files[0]);
+  try {
+    const r = await api(`/api/uploads/${side}`, { method:"POST", body: fd });
+    toast(`上传成功：共 ${r.received} 条，新增/更正 ${r.upserted} 条，`
+      + `内容未变 ${r.unchanged} 条`
+      + (r.disbanded_groups.length ? `，撤销匹配组 ${r.disbanded_groups.join(", ")}` : ""), "s");
+    await sleep(250);
+    await refreshAll();
+  } catch (e) { toast(`上传失败(HTTP ${e.status}): ${e.message}`, "e"); }
+}
+function loadSample(side) {
+  const blob = new Blob([SAMPLE[side]], { type:"text/csv" });
+  const file = new File([blob], `sample_${side}.csv`, { type:"text/csv" });
+  const dt = new DataTransfer(); dt.items.add(file);
+  document.getElementById(side + "File").files = dt.files;
+  toast("已填入示例 CSV，点击上传即可");
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function recompute() {
+  try { const r = await api("/api/recompute", { method:"POST" });
+    toast(`候选已重算，generation=${r.generation}`, "s"); await refreshAll();
+  } catch(e){ toast("重算失败: " + e.message, "e"); }
+}
+
+async function confirmCandidate(id, versions) {
+  if (!confirm(`确认候选组合 #${id}？后台将再次校验最新 version 与认领状态。`)) return;
+  try {
+    const r = await api(`/api/candidates/${id}/confirm`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ expected_versions: versions })
+    });
+    toast(`已确认匹配组 #${r.group_id}`, "s");
+    await sleep(200); await refreshAll();
+  } catch (e) {
+    let extra = "";
+    if (e.status === 409 && e.payload?.detail?.latest)
+      extra = "\n最新值: " + JSON.stringify(e.payload.detail.latest);
+    toast(`确认失败(HTTP ${e.status}): ${e.message}${extra}`, "e");
+  }
+}
+
+function renderCandidates(list) {
+  const box = document.getElementById("candidates");
+  document.getElementById("candStat").textContent = `共 ${list.length} 个可确认组合`;
+  if (!list.length) { box.innerHTML = '<p class="muted">当前没有可确认候选。</p>'; return; }
+  box.innerHTML = list.map(c => `
+    <div class="cand">
+      <div class="head">
+        <strong>候选 #${c.candidate_id}</strong>
+        <span class="mono muted">金额合计 ${c.total_amount} 分 · generation ${c.generation}</span>
+        <button onclick='confirmCandidate(${c.candidate_id}, ${JSON.stringify(c.expected_versions)})'>✔ 确认组合</button>
+      </div>
+      <div>银行：<span class="mono">${esc(c.bank.serial)}</span> ${esc(c.bank.name)}
+        ${esc(c.bank.txn_date)} · ${c.bank.amount} 分 · v${c.bank.version}</div>
+      <ul>${c.internals.map(f =>
+        `<li><span class="mono">${esc(f.serial)}</span> ${esc(f.name)} ${esc(f.txn_date)}
+         · ${f.amount} 分 · v${f.version}</li>`).join("")}</ul>
+      <details><summary>页面版本快照 expected_versions（旧页面据此检测并发变化）</summary>
+        <pre>${esc(JSON.stringify(c.expected_versions))}</pre></details>
+    </div>`).join("");
+}
+
+function renderFlows(side, flows) {
+  const tbody = document.querySelector(`#${side}Table tbody`);
+  tbody.innerHTML = flows.map(f => `<tr>
+    <td class="mono">${esc(f.serial)}</td><td>${esc(f.name)}</td>
+    <td>${esc(f.txn_date)}</td><td>${f.amount}</td>
+    <td>${statusTag(f.status)}</td><td>${f.group_id ?? "—"}</td>
+    <td class="mono">v${f.version}</td></tr>`).join("")
+    || '<tr><td colspan="7" class="muted">无数据</td></tr>';
+}
+
+function renderMatches(matches) {
+  document.getElementById("matchStat").textContent = `共 ${matches.length} 组`;
+  document.querySelector("#matchTable tbody").innerHTML = matches.map(m => `
+    <tr><td>#${m.group_id}</td>
+      <td>${m.bank.map(f => `<span class="mono">${esc(f.serial)}</span>`).join("<br>")}</td>
+      <td>${m.internals.map(f => `<span class="mono">${esc(f.serial)}</span>`).join("<br>")}</td>
+      <td>${m.bank.reduce((s,f)=>s+f.amount,0)}</td>
+      <td class="muted">${esc(m.created_at)}</td></tr>`).join("")
+    || '<tr><td colspan="5" class="muted">暂无已确认匹配</td></tr>';
+}
+
+function renderUnmatched(u) {
+  const n = u.bank.length + u.internal.length;
+  document.getElementById("unmatchedStat").textContent = `共 ${n} 条`;
+  const rows = [
+    ...u.bank.map(f => ["bank", f]), ...u.internal.map(f => ["internal", f])
+  ];
+  document.querySelector("#unmatchedTable tbody").innerHTML = rows.map(([side,f]) => `
+    <tr><td>${sideTag(side)}</td><td class="mono">${esc(f.serial)}</td>
+    <td>${esc(f.name)}</td><td>${esc(f.txn_date)}</td><td>${f.amount}</td>
+    <td class="mono">v${f.version}</td></tr>`).join("")
+    || '<tr><td colspan="6" class="muted">全部流水均已匹配 🎉</td></tr>';
+}
+
+async function refreshAll() {
+  try {
+    const [cand, bank, internal, matches, unmatched] = await Promise.all([
+      api("/api/candidates"),
+      api("/api/flows/bank"),
+      api("/api/flows/internal"),
+      api("/api/matches"),
+      api("/api/unmatched"),
+    ]);
+    renderCandidates(cand.candidates);
+    renderFlows("bank", bank.flows);
+    renderFlows("internal", internal.flows);
+    renderMatches(matches.matches);
+    renderUnmatched(unmatched);
+  } catch (e) { toast("刷新失败: " + e.message, "e"); }
+}
+refreshAll();
+setInterval(refreshAll, 5000);
+</script>
+</body>
+</html>

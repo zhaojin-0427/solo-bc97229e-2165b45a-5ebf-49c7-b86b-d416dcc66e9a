@@ -1,0 +1,20 @@
+services:
+  reconcile:
+    build: .
+    image: bank-reconcile:latest
+    container_name: bank-reconcile
+    ports:
+      - "8000:8000"
+    volumes:
+      - reconcile-data:/data
+    environment:
+      RECONCILE_DB: /data/reconcile.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  reconcile-data:
